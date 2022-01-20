@@ -57,6 +57,7 @@ struct Receiver {
         >,
     >,
     to_send: Mutex<Vec<i16>>,
+    ssrc: Mutex<Option<u32>>,
 }
 
 impl Receiver {
@@ -73,6 +74,7 @@ impl Receiver {
         Self {
             write,
             to_send: Mutex::new(vec![]),
+            ssrc: Mutex::new(None),
         }
     }
 }
@@ -117,6 +119,16 @@ impl VoiceEventHandler for Receiver {
             Ctx::VoicePacket(data) => {
                 // An event which fires for every received audio packet,
                 // containing the decoded data.
+                let ssrc = data.packet.ssrc;
+                let mut self_ssrc = self.ssrc.lock().await;
+                if let Some(s_ssrc) = *self_ssrc {
+                    if s_ssrc != ssrc {
+                        // Discard new speaker
+                        return None;
+                    }
+                } else {
+                    *self_ssrc = Some(ssrc);
+                }
                 if let Some(audio) = data.audio {
                     let mut to_send = self.to_send.lock().await;
                     (*to_send).extend(audio);
@@ -239,36 +251,43 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     };
 
     let api_token = env::var("HF_API_TOKEN").expect("Expected an API token in the environment");
-    let url = format!(
-        "wss://api-inference.huggingface.co/asr/live/cpu/{}",
-        model_id
-    );
-    // let url = "ws://localhost:8000/asr/live/gpu/facebook/wav2vec2-base-960h";
+    let debug: bool = &env::var("DEBUG").unwrap_or("0".to_string()) == "1";
+
+    let url = if debug {
+        "ws://localhost:8000/asr/live/gpu/facebook/wav2vec2-base-960h".to_string()
+    } else {
+        format!(
+            "wss://api-inference.huggingface.co/asr/live/cpu/{}",
+            model_id
+        )
+    };
     println!("Connecting to  {:?}", url);
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     let (mut write, read) = ws_stream.split();
 
     let http: Arc<Http> = Arc::clone(&ctx.http);
     let channel_id = msg.channel_id;
+    let mut status_msg = msg
+        .channel_id
+        .say(
+            &ctx.http,
+            &format!("Status: Joining... {}", connect_to.mention()),
+        )
+        .await
+        .unwrap();
     let content_msg = channel_id.say(&http, "...").await.unwrap();
-    let ws_out = {
-        // Fold shenanigans because FnMut and borrow checker.
-        read.fold((channel_id, http, content_msg), on_receive)
-    };
-    tokio::spawn(ws_out);
-    let message = TMessage::text(format!("Bearer {}", api_token));
-    write.send(message).await.unwrap();
 
     let manager = songbird::get(ctx)
         .await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
-
     let (handler_lock, conn_result) = manager.join(guild_id, connect_to).await;
     if let Ok(_) = conn_result {
         // NOTE: this skips listening for the actual connection result.
         let mut handler = handler_lock.lock().await;
 
+        let message = TMessage::text(format!("Bearer {}", api_token));
+        write.send(message).await.unwrap();
         let receiver = Receiver::new(Mutex::new(write));
         // handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), &receiver);
 
@@ -282,18 +301,29 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
 
         // handler.add_global_event(CoreEvent::ClientDisconnect.into(), &receiver);
 
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, &format!("Joined {}", connect_to.mention()))
-                .await,
-        );
+        status_msg
+            .edit(&ctx.http, |m| {
+                m.content(format!("Joined {}", connect_to.mention()))
+            })
+            .await
+            .unwrap();
     } else {
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, "Error joining the channel")
-                .await,
-        );
+        status_msg
+            .edit(&ctx.http, |m| {
+                m.content(format!(
+                    "Error joining the channel {}",
+                    connect_to.mention()
+                ))
+            })
+            .await
+            .unwrap();
     }
+
+    let ws_out = {
+        // Fold shenanigans because FnMut and borrow checker.
+        read.fold((channel_id, http, content_msg, status_msg), on_receive)
+    };
+    tokio::spawn(ws_out);
 
     Ok(())
 }
@@ -362,7 +392,7 @@ struct ASRResult {
     length_in_s: f32,
 }
 
-type Packed = (ChannelId, Arc<Http>, Message);
+type Packed = (ChannelId, Arc<Http>, Message, Message);
 #[derive(Debug, Error)]
 enum OnReceiveError {
     #[error("websocket error")]
@@ -377,6 +407,7 @@ async fn _on_receive(
     channel_id: ChannelId,
     http: Arc<Http>,
     content_msg: &mut Message,
+    status_msg: &mut Message,
     message: TMessage,
 ) -> Result<(), OnReceiveError> {
     let txt = message.into_text()?;
@@ -393,7 +424,11 @@ async fn _on_receive(
         }
         ApiMessage::Status(status) => {
             if status.message != "Successful login" {
-                channel_id.say(&http, status.message).await?;
+                if !status.message.is_empty() {
+                    status_msg
+                        .edit(&http, |m| m.content(status.message))
+                        .await?;
+                }
             }
         }
     };
@@ -402,11 +437,19 @@ async fn _on_receive(
 
 async fn on_receive(packed: Packed, message: Result<TMessage, TError>) -> Packed {
     if let Ok(ws_msg) = message {
-        let (channel_id, http, mut content_msg) = packed;
-        if let Ok(()) = _on_receive(channel_id, http.clone(), &mut content_msg, ws_msg).await {
-            (channel_id, http, content_msg)
+        let (channel_id, http, mut content_msg, mut status_msg) = packed;
+        if let Ok(()) = _on_receive(
+            channel_id,
+            http.clone(),
+            &mut content_msg,
+            &mut status_msg,
+            ws_msg,
+        )
+        .await
+        {
+            (channel_id, http, content_msg, status_msg)
         } else {
-            (channel_id, http, content_msg)
+            (channel_id, http, content_msg, status_msg)
         }
     } else {
         println!("Errors on the socket {:?}", message);
