@@ -542,6 +542,7 @@ dependencies = [
  "serde_json",
  "serenity",
  "songbird",
+ "thiserror",
  "tokio",
  "tokio-tungstenite",
 ]

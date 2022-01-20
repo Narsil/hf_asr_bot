@@ -9,9 +9,12 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as TMessage};
+use tokio_tungstenite::{
+    connect_async, tungstenite::protocol::Message as TMessage, tungstenite::Error as TError,
+};
 
 use futures::prelude::stream::SplitSink;
 use serenity::{
@@ -27,6 +30,7 @@ use serenity::{
     futures::{SinkExt, StreamExt},
     http::Http,
     model::{channel::Message, gateway::Ready, id::ChannelId, misc::Mentionable},
+    prelude::SerenityError,
     Result as SerenityResult,
 };
 
@@ -207,53 +211,6 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     let guild_id = guild.id;
     let channels = ctx.http.get_channels(*guild_id.as_u64()).await?;
 
-    let api_token = env::var("HF_API_TOKEN").expect("Expected an API token in the environment");
-    let url = "wss://api-inference.huggingface.co/asr/live/gpu/facebook/wav2vec2-base-960h";
-    // let url = "ws://localhost:8000/asr/live/gpu/facebook/wav2vec2-base-960h";
-    println!("Connecting to  {:?}", url);
-    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
-    let (mut write, read) = ws_stream.split();
-
-    let http: Arc<Http> = Arc::clone(&ctx.http);
-    let channel_id = msg.channel_id;
-    let content_msg = channel_id.say(&http, "...").await.unwrap();
-    let ws_out = {
-        // Fold shenanigans because FnMut and borrow checker.
-        read.fold(
-            (channel_id, http, content_msg),
-            |(channel_id, http, mut content_msg), message| async move {
-                if let Ok(ws_msg) = message {
-                    if let Ok(txt) = ws_msg.into_text() {
-                        let message: ApiMessage = serde_json::from_str(&txt).unwrap();
-                        match message {
-                            ApiMessage::Results(res) => {
-                                if res.partial {
-                                    if !res.text.is_empty() {
-                                        content_msg
-                                            .edit(&http, |m| m.content(res.text))
-                                            .await
-                                            .unwrap();
-                                    }
-                                } else {
-                                    content_msg = channel_id.say(&http, "...").await.unwrap();
-                                }
-                            }
-                            ApiMessage::Status(status) => {
-                                println!("Status {:?}", status.message);
-                            }
-                        }
-                    }
-                } else {
-                    println!("Error receiving {:?}", message);
-                }
-                (channel_id, http, content_msg)
-            },
-        )
-    };
-    tokio::spawn(ws_out);
-    let message = TMessage::text(format!("Bearer {}", api_token));
-    write.send(message).await.unwrap();
-
     let connect_to = match args.single::<String>() {
         Ok(name) => {
             if let Some(channel) = channels.iter().find(|c| c.name == name) {
@@ -275,6 +232,32 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
             return Ok(());
         }
     };
+
+    let model_id = match args.single::<String>() {
+        Ok(model_id) => model_id,
+        Err(_) => "facebook/wav2vec2-base-960h".to_string(),
+    };
+
+    let api_token = env::var("HF_API_TOKEN").expect("Expected an API token in the environment");
+    let url = format!(
+        "wss://api-inference.huggingface.co/asr/live/cpu/{}",
+        model_id
+    );
+    // let url = "ws://localhost:8000/asr/live/gpu/facebook/wav2vec2-base-960h";
+    println!("Connecting to  {:?}", url);
+    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
+    let (mut write, read) = ws_stream.split();
+
+    let http: Arc<Http> = Arc::clone(&ctx.http);
+    let channel_id = msg.channel_id;
+    let content_msg = channel_id.say(&http, "...").await.unwrap();
+    let ws_out = {
+        // Fold shenanigans because FnMut and borrow checker.
+        read.fold((channel_id, http, content_msg), on_receive)
+    };
+    tokio::spawn(ws_out);
+    let message = TMessage::text(format!("Bearer {}", api_token));
+    write.send(message).await.unwrap();
 
     let manager = songbird::get(ctx)
         .await
@@ -377,6 +360,58 @@ struct ASRResult {
     format: Vec<String>,
     partial: bool,
     length_in_s: f32,
+}
+
+type Packed = (ChannelId, Arc<Http>, Message);
+#[derive(Debug, Error)]
+enum OnReceiveError {
+    #[error("websocket error")]
+    WebsocketError(#[from] TError),
+    #[error("serialization error")]
+    SerdeError(#[from] serde_json::Error),
+    #[error("discord error")]
+    SerenityError(#[from] SerenityError),
+}
+
+async fn _on_receive(
+    channel_id: ChannelId,
+    http: Arc<Http>,
+    content_msg: &mut Message,
+    message: TMessage,
+) -> Result<(), OnReceiveError> {
+    let txt = message.into_text()?;
+    let api_message: ApiMessage = serde_json::from_str(&txt)?;
+    match api_message {
+        ApiMessage::Results(res) => {
+            if res.partial {
+                if !res.text.is_empty() {
+                    content_msg.edit(&http, |m| m.content(res.text)).await?;
+                }
+            } else {
+                *content_msg = channel_id.say(&http, "...").await?;
+            }
+        }
+        ApiMessage::Status(status) => {
+            if status.message != "Successful login" {
+                channel_id.say(&http, status.message).await?;
+            }
+        }
+    };
+    Ok(())
+}
+
+async fn on_receive(packed: Packed, message: Result<TMessage, TError>) -> Packed {
+    if let Ok(ws_msg) = message {
+        let (channel_id, http, mut content_msg) = packed;
+        if let Ok(()) = _on_receive(channel_id, http.clone(), &mut content_msg, ws_msg).await {
+            (channel_id, http, content_msg)
+        } else {
+            (channel_id, http, content_msg)
+        }
+    } else {
+        println!("Errors on the socket {:?}", message);
+        packed
+    }
 }
 
 #[tokio::main]
