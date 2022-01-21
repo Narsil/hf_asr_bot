@@ -27,7 +27,7 @@ use serenity::{
         },
         StandardFramework,
     },
-    futures::{SinkExt, StreamExt},
+    futures::{SinkExt, StreamExt, TryStreamExt},
     http::Http,
     model::{channel::Message, gateway::Ready, id::ChannelId, misc::Mentionable},
     prelude::SerenityError,
@@ -252,7 +252,7 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
         env::var("HF_API_DOMAIN").unwrap_or("wss://api-inference.huggingface.co".to_string());
 
     let url = format!("{}/asr/live/cpu/{}", domain, model_id);
-    println!("Connecting to  {:?}...", url);
+    println!("Connecting to  {:?}..", url);
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     let (mut write, read) = ws_stream.split();
 
@@ -312,7 +312,7 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
 
     let ws_out = {
         // Fold shenanigans because FnMut and borrow checker.
-        read.fold((channel_id, http, content_msg, status_msg), on_receive)
+        read.try_fold((channel_id, http, content_msg, status_msg), on_receive)
     };
     tokio::spawn(ws_out);
 
@@ -426,25 +426,20 @@ async fn _on_receive(
     Ok(())
 }
 
-async fn on_receive(packed: Packed, message: Result<TMessage, TError>) -> Packed {
-    if let Ok(ws_msg) = message {
-        let (channel_id, http, mut content_msg, mut status_msg) = packed;
-        if let Ok(()) = _on_receive(
-            channel_id,
-            http.clone(),
-            &mut content_msg,
-            &mut status_msg,
-            ws_msg,
-        )
-        .await
-        {
-            (channel_id, http, content_msg, status_msg)
-        } else {
-            (channel_id, http, content_msg, status_msg)
-        }
+async fn on_receive(packed: Packed, ws_msg: TMessage) -> Result<Packed, TError> {
+    let (channel_id, http, mut content_msg, mut status_msg) = packed;
+    if let Ok(()) = _on_receive(
+        channel_id,
+        http.clone(),
+        &mut content_msg,
+        &mut status_msg,
+        ws_msg,
+    )
+    .await
+    {
+        Ok((channel_id, http, content_msg, status_msg))
     } else {
-        println!("Errors on the socket {:?}", message);
-        packed
+        Ok((channel_id, http, content_msg, status_msg))
     }
 }
 
