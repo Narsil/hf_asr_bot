@@ -6,6 +6,7 @@
 //! git = "https://github.com/serenity-rs/serenity.git"
 //! features = ["client", "standard_framework", "voice"]
 //! ```
+use log::info;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
@@ -45,7 +46,7 @@ struct Handler;
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, _: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
+        info!("{} is connected!", ready.user.name);
     }
 }
 
@@ -216,6 +217,11 @@ fn convert(audio: &Vec<i16>) -> TMessage {
 #[commands(join, leave, ping)]
 struct General;
 
+async fn update_status(http: &Arc<Http>, status_msg: &mut Message, message: String) {
+    info!("{}", message);
+    status_msg.edit(http, |m| m.content(message)).await.unwrap();
+}
+
 #[command]
 #[only_in(guilds)]
 async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
@@ -252,7 +258,7 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
         env::var("HF_API_DOMAIN").unwrap_or("wss://api-inference.huggingface.co".to_string());
 
     let url = format!("{}/asr/live/cpu/{}", domain, model_id);
-    println!("Connecting to  {:?}..", url);
+    info!("Connecting to  {:?}..", url);
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     let (mut write, read) = ws_stream.split();
 
@@ -292,22 +298,19 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
 
         // handler.add_global_event(CoreEvent::ClientDisconnect.into(), &receiver);
 
-        status_msg
-            .edit(&ctx.http, |m| {
-                m.content(format!("Joined {}", connect_to.mention()))
-            })
-            .await
-            .unwrap();
+        update_status(
+            &ctx.http,
+            &mut status_msg,
+            format!("Joined {}", connect_to.mention()),
+        )
+        .await;
     } else {
-        status_msg
-            .edit(&ctx.http, |m| {
-                m.content(format!(
-                    "Error joining the channel {}",
-                    connect_to.mention()
-                ))
-            })
-            .await
-            .unwrap();
+        update_status(
+            &ctx.http,
+            &mut status_msg,
+            format!("Error joining the channel {}", connect_to.mention()),
+        )
+        .await;
     }
 
     let ws_out = {
@@ -416,9 +419,7 @@ async fn _on_receive(
         ApiMessage::Status(status) => {
             if status.message != "Successful login" {
                 if !status.message.is_empty() {
-                    status_msg
-                        .edit(&http, |m| m.content(status.message))
-                        .await?;
+                    update_status(&http, status_msg, status.message).await;
                 }
             }
         }
@@ -446,6 +447,7 @@ async fn on_receive(packed: Packed, ws_msg: TMessage) -> Result<Packed, TError> 
 #[tokio::main]
 async fn main() {
     // tracing_subscriber::fmt::init();
+    env_logger::init();
 
     // Configure the client with your Discord bot token in the environment.
     let token = env::var("HF_ASR_BOT").expect("Expected a token in the environment");
