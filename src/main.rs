@@ -222,32 +222,29 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     let guild = msg.guild(&ctx.cache).await.unwrap();
     let guild_id = guild.id;
     let channels = ctx.http.get_channels(*guild_id.as_u64()).await?;
-
-    let connect_to = match args.single::<String>() {
-        Ok(name) => {
-            if let Some(channel) = channels.iter().find(|c| c.name == name) {
-                ChannelId(*channel.id.as_u64())
-            } else {
-                check_msg(
-                    msg.reply(ctx, format!("Could not find channel {:?}", name))
-                        .await,
-                );
-                return Ok(());
-            }
-        }
-        Err(_) => {
-            check_msg(
-                msg.reply(ctx, "Requires a valid voice channel ID be given")
-                    .await,
-            );
-
-            return Ok(());
-        }
+    let name = "playground";
+    let connect_to = if let Some(channel) = channels.iter().find(|c| c.name == name) {
+        ChannelId(*channel.id.as_u64())
+    } else {
+        check_msg(
+            msg.reply(ctx, format!("Could not find channel {}", name))
+                .await,
+        );
+        return Ok(());
     };
 
     let model_id = match args.single::<String>() {
         Ok(model_id) => model_id,
-        Err(_) => "facebook/wav2vec2-base-960h".to_string(),
+        Err(_) => {
+            check_msg(
+                msg.reply(
+                    ctx,
+                    format!("Which model do you want to use ? `!join MODEL_ID`",),
+                )
+                .await,
+            );
+            return Ok(());
+        }
     };
 
     let api_token = env::var("HF_API_TOKEN").expect("Expected an API token in the environment");
