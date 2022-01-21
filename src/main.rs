@@ -251,16 +251,10 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     };
 
     let api_token = env::var("HF_API_TOKEN").expect("Expected an API token in the environment");
-    let debug: bool = &env::var("DEBUG").unwrap_or("0".to_string()) == "1";
+    let domain: String =
+        env::var("HF_API_DOMAIN").unwrap_or("wss://api-inference.huggingface.co".to_string());
 
-    let url = if debug {
-        "ws://localhost:8000/asr/live/gpu/facebook/wav2vec2-base-960h".to_string()
-    } else {
-        format!(
-            "wss://api-inference.huggingface.co/asr/live/cpu/{}",
-            model_id
-        )
-    };
+    let url = format!("{}/asr/live/cpu/{}", domain, model_id);
     println!("Connecting to  {:?}", url);
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     let (mut write, read) = ws_stream.split();
