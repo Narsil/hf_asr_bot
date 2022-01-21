@@ -255,7 +255,7 @@ async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
         env::var("HF_API_DOMAIN").unwrap_or("wss://api-inference.huggingface.co".to_string());
 
     let url = format!("{}/asr/live/cpu/{}", domain, model_id);
-    println!("Connecting to  {:?}", url);
+    println!("Connecting to  {:?}...", url);
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     let (mut write, read) = ws_stream.split();
 
